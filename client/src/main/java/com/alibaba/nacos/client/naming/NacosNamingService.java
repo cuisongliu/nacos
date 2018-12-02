@@ -16,6 +16,7 @@
 package com.alibaba.nacos.client.naming;
 
 import com.alibaba.nacos.api.PropertyKeyConst;
+import com.alibaba.nacos.api.common.Constants;
 import com.alibaba.nacos.api.exception.NacosException;
 import com.alibaba.nacos.api.naming.NamingService;
 import com.alibaba.nacos.api.naming.listener.EventListener;
@@ -30,8 +31,10 @@ import com.alibaba.nacos.client.naming.core.EventDispatcher;
 import com.alibaba.nacos.client.naming.core.HostReactor;
 import com.alibaba.nacos.client.naming.net.NamingProxy;
 import com.alibaba.nacos.client.naming.utils.CollectionUtils;
+import com.alibaba.nacos.client.naming.utils.LogUtils;
 import com.alibaba.nacos.client.naming.utils.StringUtils;
 import com.alibaba.nacos.client.naming.utils.UtilAndComs;
+import org.apache.commons.lang3.BooleanUtils;
 
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -78,6 +81,13 @@ public class NacosNamingService implements NamingService {
             logName = "naming.log";
         }
 
+        String logLevel = System.getProperty(UtilAndComs.NACOS_NAMING_LOG_LEVEL);
+        if (StringUtils.isEmpty(logLevel)) {
+            logLevel = "INFO";
+        }
+
+        LogUtils.setLogLevel(logLevel);
+
         cacheDir = System.getProperty("com.alibaba.nacos.naming.cache.dir");
         if (StringUtils.isEmpty(cacheDir)) {
             cacheDir = System.getProperty("user.home") + "/nacos/naming/" + namespace;
@@ -91,7 +101,7 @@ public class NacosNamingService implements NamingService {
         eventDispatcher = new EventDispatcher();
         serverProxy = new NamingProxy(namespace, endpoint, serverList);
         beatReactor = new BeatReactor(serverProxy);
-        hostReactor = new HostReactor(eventDispatcher, serverProxy, cacheDir);
+        hostReactor = new HostReactor(eventDispatcher, serverProxy, cacheDir, false);
     }
 
     public NacosNamingService(Properties properties) {
@@ -115,16 +125,21 @@ public class NacosNamingService implements NamingService {
 
         cacheDir = System.getProperty("user.home") + "/nacos/naming/" + namespace;
 
+        boolean loadCacheAtStart = false;
+        if (StringUtils.isNotEmpty(properties.getProperty(PropertyKeyConst.NAMING_LOAD_CACHE_AT_START))) {
+            loadCacheAtStart = BooleanUtils.toBoolean(properties.getProperty(PropertyKeyConst.NAMING_LOAD_CACHE_AT_START));
+        }
+
         eventDispatcher = new EventDispatcher();
         serverProxy = new NamingProxy(namespace, endpoint, serverList);
         beatReactor = new BeatReactor(serverProxy);
-        hostReactor = new HostReactor(eventDispatcher, serverProxy, cacheDir);
+        hostReactor = new HostReactor(eventDispatcher, serverProxy, cacheDir, loadCacheAtStart);
 
     }
 
     @Override
     public void registerInstance(String serviceName, String ip, int port) throws NacosException {
-        registerInstance(serviceName, ip, port, StringUtils.EMPTY);
+        registerInstance(serviceName, ip, port, Constants.NAMING_DEFAULT_CLUSTER_NAME);
     }
 
     @Override
@@ -133,7 +148,7 @@ public class NacosNamingService implements NamingService {
         instance.setIp(ip);
         instance.setPort(port);
         instance.setWeight(1.0);
-        instance.setCluster(new Cluster(clusterName));
+        instance.setClusterName(clusterName);
 
         registerInstance(serviceName, instance);
     }
@@ -145,7 +160,9 @@ public class NacosNamingService implements NamingService {
         beatInfo.setDom(serviceName);
         beatInfo.setIp(instance.getIp());
         beatInfo.setPort(instance.getPort());
-        beatInfo.setCluster(instance.getCluster().getName());
+        beatInfo.setCluster(instance.getClusterName());
+        beatInfo.setWeight(instance.getWeight());
+        beatInfo.setMetadata(instance.getMetadata());
 
         beatReactor.addBeatInfo(serviceName, beatInfo);
 
@@ -154,12 +171,12 @@ public class NacosNamingService implements NamingService {
 
     @Override
     public void deregisterInstance(String serviceName, String ip, int port) throws NacosException {
-        deregisterInstance(serviceName, ip, port, StringUtils.EMPTY);
+        deregisterInstance(serviceName, ip, port, Constants.NAMING_DEFAULT_CLUSTER_NAME);
     }
 
     @Override
     public void deregisterInstance(String serviceName, String ip, int port, String clusterName) throws NacosException {
-        beatReactor.removeBeatInfo(serviceName);
+        beatReactor.removeBeatInfo(serviceName, ip, port);
         serverProxy.deregisterService(serviceName, ip, port, clusterName);
     }
 
@@ -174,7 +191,7 @@ public class NacosNamingService implements NamingService {
         ServiceInfo serviceInfo = hostReactor.getServiceInfo(serviceName, StringUtils.join(clusters, ","), StringUtils.EMPTY, false);
         List<Instance> list;
         if (serviceInfo == null || CollectionUtils.isEmpty(list = serviceInfo.getHosts())) {
-            throw new IllegalStateException("no host to srv for dom: " + serviceName);
+            return new ArrayList<Instance>();
         }
         return list;
     }
@@ -190,24 +207,14 @@ public class NacosNamingService implements NamingService {
         ServiceInfo serviceInfo = hostReactor.getServiceInfo(serviceName, StringUtils.join(clusters, ","), StringUtils.EMPTY, false);
         List<Instance> list;
         if (serviceInfo == null || CollectionUtils.isEmpty(list = serviceInfo.getHosts())) {
-            throw new IllegalStateException("no host to srv for dom: " + serviceName);
+            return new ArrayList<Instance>();
         }
 
-        if (healthy) {
-            Iterator<Instance> iterator = list.iterator();
-            while (iterator.hasNext()) {
-                Instance instance = iterator.next();
-                if (!instance.isHealthy()) {
-                    iterator.remove();
-                }
-            }
-        } else {
-            Iterator<Instance> iterator = list.iterator();
-            while (iterator.hasNext()) {
-                Instance instance = iterator.next();
-                if (instance.isHealthy()) {
-                    iterator.remove();
-                }
+        Iterator<Instance> iterator = list.iterator();
+        while (iterator.hasNext()) {
+            Instance instance = iterator.next();
+            if (healthy != instance.isHealthy() || !instance.isEnabled() || instance.getWeight() <= 0) {
+                iterator.remove();
             }
         }
 
@@ -251,11 +258,15 @@ public class NacosNamingService implements NamingService {
 
     @Override
     public List<ServiceInfo> getSubscribeServices() {
-        return new ArrayList<>(hostReactor.getServiceInfoMap().values());
+        return new ArrayList<ServiceInfo>(hostReactor.getServiceInfoMap().values());
     }
 
     @Override
     public String getServerStatus() {
         return serverProxy.serverHealthy() ? "UP" : "DOWN";
+    }
+
+    public BeatReactor getBeatReactor() {
+        return beatReactor;
     }
 }

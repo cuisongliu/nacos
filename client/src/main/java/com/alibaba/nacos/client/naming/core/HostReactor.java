@@ -43,6 +43,8 @@ public class HostReactor {
 
     private Map<String, ServiceInfo> serviceInfoMap;
 
+    private Map<String, Object> updatingMap;
+
     private PushRecver pushRecver;
 
     private EventDispatcher eventDispatcher;
@@ -53,11 +55,18 @@ public class HostReactor {
 
     private String cacheDir;
 
-    public HostReactor(EventDispatcher eventDispatcher, NamingProxy serverProxy, String cacheDir) {
+
+    public HostReactor(EventDispatcher eventDispatcher, NamingProxy serverProxy, String cacheDir, boolean loadCacheAtStart) {
         this.eventDispatcher = eventDispatcher;
         this.serverProxy = serverProxy;
         this.cacheDir = cacheDir;
-        this.serviceInfoMap = new ConcurrentHashMap<>(DiskCache.read(this.cacheDir));
+        if (loadCacheAtStart) {
+            this.serviceInfoMap = new ConcurrentHashMap<String, ServiceInfo>(DiskCache.read(this.cacheDir));
+        } else {
+            this.serviceInfoMap = new ConcurrentHashMap<String, ServiceInfo>(16);
+        }
+
+        this.updatingMap = new ConcurrentHashMap<String, Object>();
         this.failoverReactor = new FailoverReactor(this, cacheDir);
         this.pushRecver = new PushRecver(this);
     }
@@ -110,7 +119,7 @@ public class HostReactor {
             Set<Instance> newHosts = new HashSet<Instance>();
             Set<Instance> remvHosts = new HashSet<Instance>();
 
-            List<Map.Entry<String, Instance>> newServiceHosts = new ArrayList<>(newHostMap.entrySet());
+            List<Map.Entry<String, Instance>> newServiceHosts = new ArrayList<Map.Entry<String, Instance>>(newHostMap.entrySet());
             for (Map.Entry<String, Instance> entry : newServiceHosts) {
                 Instance host = entry.getValue();
                 String key = entry.getKey();
@@ -218,12 +227,16 @@ public class HostReactor {
 
             serviceInfoMap.put(serviceObj.getKey(), serviceObj);
 
+            updatingMap.put(serviceName, new Object());
+
             if (allIPs) {
                 updateService4AllIPNow(serviceName, clusters, env);
             } else {
                 updateServiceNow(serviceName, clusters, env);
             }
-        } else if (serviceObj.getHosts().isEmpty()) {
+            updatingMap.remove(serviceName);
+
+        } else if (updatingMap.containsKey(serviceName)) {
 
             if (updateHoldInterval > 0) {
                 // hold a moment waiting for update finish
